@@ -133,9 +133,7 @@ http2_connection(ConnectionId) ->
                        , notification()
                        , apns:headers()) -> apns:response().
 push_notification(ConnectionId, DeviceId, Notification, Headers) ->
-  {Timeout, StreamId} =
-    gen_server:call(ConnectionId, {push_notification, DeviceId, Notification, Headers}),
-  wait_response(ConnectionId, Timeout, StreamId).
+    gen_server:call(ConnectionId, {push_notification, DeviceId, Notification, Headers}, infinity).
 
 %% @doc Pushes notification to certificate APNs connection.
 -spec push_notification( name() | pid()
@@ -144,9 +142,7 @@ push_notification(ConnectionId, DeviceId, Notification, Headers) ->
                        , notification()
                        , apns:headers()) -> apns:response().
 push_notification(ConnectionId, Token, DeviceId, Notification, Headers) ->
-  {Timeout, StreamId} =
-    gen_server:call(ConnectionId, {push_notification, Token, DeviceId, Notification, Headers}),
-  wait_response(ConnectionId, Timeout, StreamId).
+    gen_server:call(ConnectionId, {push_notification, Token, DeviceId, Notification, Headers}, infinity).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -174,7 +170,15 @@ handle_call( {push_notification, DeviceId, Notification, Headers}
   #{connection := Connection, http2_connection := HTTP2Conn} = State,
   #{timeout := Timeout} = Connection,
   StreamId = push(HTTP2Conn, DeviceId, Headers, Notification, Connection),
-  {reply, {Timeout, StreamId}, State};
+  receive
+      {'END_STREAM', StreamId} ->
+          {ok, {ResponseHeaders, ResponseBody}} = h2_client:get_response(HTTP2Conn, StreamId),
+          {Status, ResponseHeaders2} = normalize_response(ResponseHeaders),
+          ResponseBody2 = normalize_response_body(ResponseBody),
+          {reply, {Status, ResponseHeaders2, ResponseBody2}, State}
+  after Timeout ->
+            {timeout, StreamId}
+  end;
 handle_call( {push_notification, Token, DeviceId, Notification, HeadersMap}
            , _From
            , State) ->
@@ -182,7 +186,15 @@ handle_call( {push_notification, Token, DeviceId, Notification, HeadersMap}
   Headers = add_authorization_header(HeadersMap, Token),
   #{timeout := Timeout} = Connection,
   StreamId = push(HTTP2Conn, DeviceId, Headers, Notification, Connection),
-  {reply, {Timeout, StreamId}, State};
+  receive
+      {'END_STREAM', StreamId} ->
+          {ok, {ResponseHeaders, ResponseBody}} = h2_client:get_response(HTTP2Conn, StreamId),
+          {Status, ResponseHeaders2} = normalize_response(ResponseHeaders),
+          ResponseBody2 = normalize_response_body(ResponseBody),
+          {reply, {Status, ResponseHeaders2, ResponseBody2}, State}
+  after Timeout ->
+            {timeout, StreamId}
+  end;
 handle_call(_Request, _From, State) ->
   {reply, ok, State}.
 
@@ -212,12 +224,6 @@ handle_info(reconnect, State) ->
   HTTP2Conn = open_http2_connection(Connection),
   Client ! {connection_up, self()},
   {noreply, State#{http2_connection => HTTP2Conn , backoff => 1}};
-handle_info({'END_STREAM', StreamId}, #{http2_connection := HTTP2Conn, client := Client} = State) ->
-  {ok, {ResponseHeaders, ResponseBody}} = h2_client:get_response(HTTP2Conn, StreamId),
-  {Status, ResponseHeaders2} = normalize_response(ResponseHeaders),
-  ResponseBody2 = normalize_response_body(ResponseBody),
-  Client ! {apns_response, self(), StreamId, {Status, ResponseHeaders2, ResponseBody2}},
-  {noreply, State};
 handle_info(_Info, State) ->
   {noreply, State}.
 
@@ -334,17 +340,6 @@ normalize_response_body([]) ->
   no_body;
 normalize_response_body([ResponseBody]) ->
   jsx:decode(ResponseBody).
-
--spec wait_response(name() | pid(), integer(), integer()) -> apns:response().
-wait_response(ConnectionId, Timeout, StreamID) when is_atom(ConnectionId) ->
-  Server = whereis(ConnectionId),
-  wait_response(Server, Timeout, StreamID);
-wait_response(ConnectionId, Timeout, StreamID) when is_pid(ConnectionId) ->
-  receive
-    {apns_response, ConnectionId, StreamID, Response} -> Response
-  after
-    Timeout -> {timeout, StreamID}
-  end.
 
 -spec backoff(non_neg_integer(), non_neg_integer()) -> non_neg_integer().
 backoff(N, Ceiling) ->
